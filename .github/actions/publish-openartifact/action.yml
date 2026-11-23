@@ -1,0 +1,116 @@
+name: Publish artifact to OpenArtifact
+description: Zip build outputs and publish them to artifactory.plankbyte.com
+
+inputs:
+  name:
+    description: Artifact name, without the .zip suffix
+    required: true
+  paths:
+    description: Newline-separated paths/globs; prefix a line with ! to exclude
+    required: true
+  token:
+    description: OpenArtifact deploy token (secrets.OPENARTIFACT_TOKEN)
+    required: true
+  missing:
+    description: What to do when nothing matches - error, warn or ignore
+    required: false
+    default: error
+  base-url:
+    description: OpenArtifact base URL
+    required: false
+    default: https://artifactory.plankbyte.com
+
+runs:
+  using: composite
+  steps:
+    - name: Publish to OpenArtifact
+      shell: bash
+      env:
+        OA_NAME: ${{ inputs.name }}
+        OA_PATHS: ${{ inputs.paths }}
+        OA_TOKEN: ${{ inputs.token }}
+        OA_MISSING: ${{ inputs.missing }}
+        OA_URL: ${{ inputs.base-url }}
+        REPO: ${{ github.event.repository.name }}
+        REF: ${{ github.ref_name }}
+        RUN_ID: ${{ github.run_id }}
+        SHA: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+        cd "$GITHUB_WORKSPACE"
+        OA_TOKEN=$(printf '%s' "$OA_TOKEN" | tr -d '\r\n')
+
+        work="$(mktemp -d)"
+        zipfile="$work/artifact.zip"
+        skip="$work/skip"
+
+        python3 - "$zipfile" "$skip" <<'PY'
+        import fnmatch, glob, os, re, sys, zipfile
+
+        zipfile_path, skip_path = sys.argv[1], sys.argv[2]
+        name = re.sub(r"[^A-Za-z0-9._-]+", "-", os.environ["OA_NAME"]).strip("-") or "artifact"
+        missing = os.environ.get("OA_MISSING", "error")
+        patterns = [line.strip() for line in os.environ["OA_PATHS"].splitlines() if line.strip()]
+        includes = [p for p in patterns if not p.startswith("!")]
+        excludes = [p[1:] for p in patterns if p.startswith("!")]
+
+        files = []
+        for pattern in includes:
+            matches = glob.glob(pattern, recursive=True)
+            if not matches:
+                print(f"::warning::No files matched {pattern}")
+                if missing == "error":
+                    sys.exit(1)
+                continue
+            for match in matches:
+                if os.path.isdir(match):
+                    for root, _, names in os.walk(match):
+                        files.extend(os.path.join(root, n) for n in names)
+                else:
+                    files.append(match)
+
+        def excluded(path):
+            path = path.replace(os.sep, "/")
+            for pattern in excludes:
+                pattern = pattern.replace(os.sep, "/")
+                if fnmatch.fnmatch(path, pattern) or path.startswith(pattern.rstrip("/") + "/"):
+                    return True
+            return False
+
+        files = sorted({f for f in files if not excluded(f)})
+        if not files:
+            if missing == "error":
+                print("::error::No files to publish")
+                sys.exit(1)
+            if missing == "warn":
+                print("::warning::No files to publish; skipping")
+            with open(skip_path, "w") as fh:
+                fh.write("1")
+            sys.exit(0)
+
+        with zipfile.ZipFile(zipfile_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for path in files:
+                arcname = path.replace(os.sep, "/")
+                if arcname.startswith("./"):
+                    arcname = arcname[2:]
+                archive.write(path, arcname)
+        print(f"Zipped {len(files)} file(s)")
+        PY
+
+        if [ -f "$skip" ]; then
+          echo "Nothing to publish; skipping OpenArtifact upload"
+          exit 0
+        fi
+
+        slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-' | sed 's/--*/-/g; s/^-//; s/-$//'; }
+        repo=$(slug "$REPO")
+        ref=$(slug "$REF")
+        name=$(slug "$OA_NAME")
+        short=${SHA:0:7}
+        dest="ci/$repo/$ref/$RUN_ID/$short/$name.zip"
+
+        curl -fsS -u "admin:$OA_TOKEN" \
+          --upload-file "$zipfile" \
+          "$OA_URL/repos/raw/builds/$dest"
+
+        echo "Published $OA_URL/repos/raw/builds/$dest"
